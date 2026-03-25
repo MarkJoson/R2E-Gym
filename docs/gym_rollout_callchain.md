@@ -273,7 +273,7 @@ runagent_multiple(dataset, k, max_workers)
               ├── env.add_commands()     ← 注入工具
               ├── [构造 system + user prompt]
               └── while not done:
-                    ├── litellm.completion(history, tools)
+                    ├── litellm.completion(history, tools)  ← 见第五节
                     ├── parse → (thought, Action)
                     ├── env.step(action)
                     │     └── runtime.run(bash_cmd, 90s)
@@ -285,3 +285,92 @@ runagent_multiple(dataset, k, max_workers)
         └── _calculate_reward()         ← 运行测试套件
               └── 返回 (reward, test_output)
 ```
+
+---
+
+## 第五节：LLM 请求路由（R2E-Gym ↔ vLLM ↔ rLLM）
+
+R2E-Gym 与 rLLM **无直接代码依赖**，通过 **vLLM OpenAI 兼容 HTTP Server** 松耦合。
+
+### 系统分工
+
+| 系统 | 职责 |
+|---|---|
+| **rLLM** | RL 训练（PPO/GRPO），产出训练后的策略模型权重 |
+| **vLLM Server** | 加载 rLLM 训练权重，暴露 OpenAI 兼容 REST API |
+| **R2E-Gym Agent** | 通过 `litellm` 调用 vLLM HTTP API 获取 LLM 响应 |
+
+### 请求路由全链路
+
+```
+┌─────────────────────────────────────────────────────┐
+│  rLLM 训练完成 → 输出模型权重                         │
+└───────────────────────┬─────────────────────────────┘
+                        ↓ 加载权重
+┌─────────────────────────────────────────────────────┐
+│  vllm serve <model> --port 8000                     │
+│  → OpenAI 兼容 HTTP Server: http://localhost:8000/v1│
+└───────────────────────┬─────────────────────────────┘
+                        ↓ HTTP POST /v1/chat/completions
+┌─────────────────────────────────────────────────────┐
+│  Agent.__init__                                     │
+│    llm_name = "openai/agentica-org/DeepSWE-Preview" │
+│    if "openai/" in llm_name:                        │
+│      llm_base_url = os.environ.get(                 │
+│          "LLM_BASE_URL", "http://localhost:8000/v1" │
+│      )                                              │
+│                                                     │
+│  litellm.completion(                                │
+│      model    = llm_name,                           │
+│      messages = history,                            │
+│      api_base = llm_base_url,   ← 指向 vLLM        │
+│      api_key  = None,           ← 本地无需认证      │
+│      tools    = [...],          ← fn_calling 工具   │
+│  )                                                  │
+└─────────────────────────────────────────────────────┘
+```
+
+### `llm_name` 前缀路由规则
+
+| `llm_name` 格式 | `api_base` | 目标 |
+|---|---|---|
+| `"gpt-4o"` | `None` | OpenAI 官方 API |
+| `"claude-3-5-sonnet-..."` | `None` | Anthropic API |
+| `"openai/<model>"` | `$LLM_BASE_URL`（默认 `:8000`）| **本地 vLLM** |
+| `"hosted_vllm/<model>"` | `$LLM_BASE_URL` | **本地 vLLM** |
+| `"vllm/<org>/<model>"` | `$LLM_BASE_URL` | **本地 vLLM** |
+
+### 标准部署流程（DeepSWE 示例）
+
+```bash
+# 1. rLLM 训练完，权重发布到 HuggingFace
+# 2. 启动 vLLM 服务（8 GPU TP）
+vllm serve agentica-org/DeepSWE-Preview \
+    --tensor-parallel-size 8 \
+    --max-model-len 65536 \
+    --enable_prefix_caching \
+    --port 8000
+
+# 3. R2E-Gym 并行 rollout，LLM_BASE_URL 指向 vLLM
+export LLM_BASE_URL="http://localhost:8000/v1"
+python src/r2egym/agenthub/run/edit.py runagent_multiple \
+    --llm_name "openai/agentica-org/DeepSWE-Preview" \
+    --max_workers 48 \
+    --backend "docker"
+```
+
+### Function Calling 支持条件
+
+```python
+# agent.py:330-337
+support_fn_calling = (
+    "gpt" in llm_name
+    or "sonnet" in llm_name
+    or "o3" in llm_name
+    or "o4" in llm_name
+    and "qwen" not in llm_name
+)
+self.use_fn_calling = use_fn_calling and support_fn_calling
+```
+
+> **非 fn_calling 模式**（DeepSWE 默认）：LLM 在响应文本中输出 `<function=...></function>` XML 标签，由 `parse_response()` 正则解析为 `Action` 对象。
