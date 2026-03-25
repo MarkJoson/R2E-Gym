@@ -145,13 +145,13 @@ sequenceDiagram
 
 ```mermaid
 flowchart LR
-    A[env.close()] --> B[DockerRuntime.stop_container()]
+    A["env.close"] --> B["stop_container"]
     B --> C{backend}
-    C -->|docker| D[container.stop() + container.remove()]
-    C -->|kubernetes| E[delete_namespaced_pod grace=0]
-    E --> F[watch DELETED 事件]
-    F -->|404| G[✅ Pod 已删除]
-    F -->|超时| H[强制二次删除]
+    C -->|docker| D["container.stop + remove"]
+    C -->|kubernetes| E["delete_namespaced_pod grace=0"]
+    E --> F["watch DELETED 事件"]
+    F -->|404| G["✅ Pod 已删除"]
+    F -->|超时| H["强制二次删除"]
 ```
 
 ---
